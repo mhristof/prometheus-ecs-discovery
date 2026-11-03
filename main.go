@@ -227,15 +227,10 @@ func (t *AugmentedTask) ExporterInformation(cfg *exporterConfig) []*PrometheusTa
 		if t.EC2Instance == nil {
 			return ret
 		}
-		instanceDNS := aws.ToString(t.EC2Instance.PrivateDnsName)
-		for _, iface := range t.EC2Instance.NetworkInterfaces {
-			ifaceIP := aws.ToString(iface.PrivateIpAddress)
-			ifaceDNS := aws.ToString(iface.PrivateDnsName)
-			if ifaceIP != "" && ifaceDNS != "" && ifaceDNS == instanceDNS {
-				ip = ifaceIP
-				break
-			}
-		}
+		// The instance's primary private IP address. Matching network
+		// interfaces by private DNS name, as was done before, fails on
+		// instances that have no DNS hostname.
+		ip = aws.ToString(t.EC2Instance.PrivateIpAddress)
 		if ip == "" {
 			return ret
 		}
