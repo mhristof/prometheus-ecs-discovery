@@ -173,6 +173,21 @@ type PrometheusTaskInfo struct {
 	Labels  labels   `yaml:"labels"`
 }
 
+// ipv4Bindings returns the network bindings that are not IPv6. On
+// dual-stack hosts Docker binds each published port on both 0.0.0.0
+// and ::, possibly with different host ports, and the targets we
+// generate always use an IPv4 address.
+func ipv4Bindings(bindings []ecstypes.NetworkBinding) []ecstypes.NetworkBinding {
+	var ret []ecstypes.NetworkBinding
+	for _, nb := range bindings {
+		if strings.Contains(aws.ToString(nb.BindIP), ":") {
+			continue
+		}
+		ret = append(ret, nb)
+	}
+	return ret
+}
+
 // ExporterInformation returns a list of []*PrometheusTaskInfo
 // enumerating the IPs, ports that the task's containers exports
 // to Prometheus (one per container), so long as the Docker
@@ -244,6 +259,7 @@ func (t *AugmentedTask) ExporterInformation(cfg *exporterConfig) []*PrometheusTa
 		}
 
 		targetIP := ip
+		bindings := ipv4Bindings(i.NetworkBindings)
 		var hostPort int32
 		if cfg.DynamicPortDetection {
 			v, ok := d.DockerLabels[dynamicPortLabel]
@@ -253,13 +269,13 @@ func (t *AugmentedTask) ExporterInformation(cfg *exporterConfig) []*PrometheusTa
 				continue
 			}
 
-			if len(i.NetworkBindings) != 1 {
+			if len(bindings) != 1 {
 				// Dynamic port mapping is only supported with a single binding.
 				// Otherwise, how would we know which port to use?
 				continue
 			}
 
-			hostPort = aws.ToInt32(i.NetworkBindings[0].HostPort)
+			hostPort = aws.ToInt32(bindings[0].HostPort)
 		} else {
 			v, ok := d.DockerLabels[cfg.PortLabel]
 			if !ok {
@@ -276,7 +292,7 @@ func (t *AugmentedTask) ExporterInformation(cfg *exporterConfig) []*PrometheusTa
 			}
 
 			if len(i.NetworkBindings) > 0 {
-				for _, nb := range i.NetworkBindings {
+				for _, nb := range bindings {
 					if nb.ContainerPort != nil && int(*nb.ContainerPort) == exporterPort {
 						hostPort = aws.ToInt32(nb.HostPort)
 					}

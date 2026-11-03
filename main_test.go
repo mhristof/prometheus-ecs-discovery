@@ -50,6 +50,12 @@ func binding(containerPort, hostPort int32) ecstypes.NetworkBinding {
 	return ecstypes.NetworkBinding{ContainerPort: aws.Int32(containerPort), HostPort: aws.Int32(hostPort)}
 }
 
+func bindingIP(bindIP string, containerPort, hostPort int32) ecstypes.NetworkBinding {
+	nb := binding(containerPort, hostPort)
+	nb.BindIP = aws.String(bindIP)
+	return nb
+}
+
 func containerDef(name string, dockerLabels map[string]string) ecstypes.ContainerDefinition {
 	return ecstypes.ContainerDefinition{
 		Name:         aws.String(name),
@@ -241,6 +247,22 @@ func TestExporterInformationTargets(t *testing.T) {
 				containerDef("two", map[string]string{dynamicPortLabel: "1"}),
 				containerDef("off", map[string]string{dynamicPortLabel: "0"})),
 			want: []string{"10.0.0.1:32770"},
+		},
+		{
+			name: "dual-stack bindings use the IPv4 host port",
+			cfg:  defaultConfig(),
+			task: task(ecstypes.LaunchTypeEc2, ec2Instance("10.0.0.1"),
+				[]ecstypes.Container{container("app", bindingIP("0.0.0.0", 9100, 32769), bindingIP("::", 9100, 32770))},
+				containerDef("app", port)),
+			want: []string{"10.0.0.1:32769"},
+		},
+		{
+			name: "dynamic mode ignores the IPv6 binding of a dual-stack port",
+			cfg:  dynamic,
+			task: task(ecstypes.LaunchTypeEc2, ec2Instance("10.0.0.1"),
+				[]ecstypes.Container{container("app", bindingIP("0.0.0.0", 8080, 32769), bindingIP("::", 8080, 32770))},
+				containerDef("app", map[string]string{dynamicPortLabel: "1"})),
+			want: []string{"10.0.0.1:32769"},
 		},
 		{
 			name: "dynamic mode applies the filter label",
