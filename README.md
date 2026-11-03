@@ -102,3 +102,8 @@ file the minute it is written).  After reloading your Prometheus
 master configuration, this program will begin informing via
 the discovery file of new targets that Prometheus must scrape.
 
+## Releases
+
+Pushing a `v*` tag runs GoReleaser, which publishes a GitHub release
+with Linux and macOS (amd64/arm64) binaries and checksums, and pushes
+a multi-arch image to `ghcr.io/mhristof/prometheus-ecs-discovery`.

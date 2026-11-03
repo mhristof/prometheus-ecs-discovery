@@ -1,0 +1,5 @@
+# Used by GoReleaser, which copies in the binaries it has already built.
+FROM gcr.io/distroless/static-debian13:nonroot
+ARG TARGETPLATFORM
+COPY $TARGETPLATFORM/prometheus-ecs-discovery /bin/
+ENTRYPOINT ["/bin/prometheus-ecs-discovery"]
