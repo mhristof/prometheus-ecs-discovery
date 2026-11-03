@@ -5,6 +5,6 @@ RUN go mod download
 COPY *.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /bin/prometheus-ecs-discovery .
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian13:nonroot
 COPY --from=build /bin/prometheus-ecs-discovery /bin/
 ENTRYPOINT ["/bin/prometheus-ecs-discovery"]
