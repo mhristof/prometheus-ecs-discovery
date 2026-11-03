@@ -29,8 +29,9 @@ func defaultConfig() *exporterConfig {
 func ec2Instance(ip string) *ec2types.Instance {
 	dns := "ip-" + ip + ".ec2.internal"
 	return &ec2types.Instance{
-		InstanceId:     aws.String("i-1"),
-		PrivateDnsName: aws.String(dns),
+		InstanceId:       aws.String("i-1"),
+		PrivateDnsName:   aws.String(dns),
+		PrivateIpAddress: aws.String(ip),
 		NetworkInterfaces: []ec2types.InstanceNetworkInterface{
 			{PrivateIpAddress: aws.String("10.9.9.9"), PrivateDnsName: aws.String("other")},
 			{PrivateIpAddress: aws.String(ip), PrivateDnsName: aws.String(dns)},
@@ -121,7 +122,19 @@ func TestExporterInformationTargets(t *testing.T) {
 			want: []string{},
 		},
 		{
-			name: "ec2 instance without matching interface is skipped",
+			name: "ec2 instance without DNS hostname is discovered",
+			cfg:  defaultConfig(),
+			task: task(ecstypes.LaunchTypeEc2, &ec2types.Instance{
+				PrivateIpAddress:  aws.String("10.0.0.2"),
+				PrivateDnsName:    aws.String(""),
+				NetworkInterfaces: []ec2types.InstanceNetworkInterface{{PrivateIpAddress: aws.String("10.0.0.2")}},
+			},
+				[]ecstypes.Container{container("app", binding(9100, 32769))},
+				containerDef("app", port)),
+			want: []string{"10.0.0.2:32769"},
+		},
+		{
+			name: "ec2 instance without private IP is skipped",
 			cfg:  defaultConfig(),
 			task: task(ecstypes.LaunchTypeEc2, &ec2types.Instance{PrivateDnsName: aws.String("x")},
 				[]ecstypes.Container{container("app", binding(9100, 32769))},
