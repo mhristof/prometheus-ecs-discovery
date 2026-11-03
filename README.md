@@ -29,10 +29,14 @@ The command line parameters that can be used are:
 * -config.filter-label (string): docker label (and optional value) to filter on "NAME_OF_LABEL[=VALUE]".
 * -config.port-label (string): Docker label to define the scrape port of the application
   (if missing an application won't be scraped) (default "PROMETHEUS_EXPORTER_PORT")
+* -config.scheme-label (string): Docker label to define the scheme of the target application
+  (default "PROMETHEUS_EXPORTER_SCHEME")
+* -config.dynamic-port-detection (bool): if true, only containers with the Docker label
+  `PROMETHEUS_DYNAMIC_EXPORT=1` and a single port mapping are scraped, on their host port
 
 ## Usage
 
-First, build this program using the usual `go get` mechanism.
+First, build this program with `go build`, or build the Docker image with `docker build .`.
 
 Then, run it as follows:
 
@@ -42,7 +46,7 @@ Then, run it as follows:
   `AWS_SECRET_ACCESS_KEY` into the environment of the program,
   making sure that the keys have access to the EC2 / ECS APIs
   (IAM policies should include `ECS:ListClusters`,
-  `ECS:ListTasks`, `ECS:DescribeTask`, `EC2:DescribeInstances`,
+  `ECS:ListTasks`, `EC2:DescribeInstances`,
   `ECS:DescribeContainerInstances`, `ECS:DescribeTasks`,
   `ECS:DescribeTaskDefinition`, `ECS:DescribeClusters`). If the program needs to assume
   a different role to obtain access, this role's ARN may be
