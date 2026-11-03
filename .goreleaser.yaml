@@ -7,10 +7,8 @@ builds:
       - CGO_ENABLED=0
     goos:
       - linux
-      - darwin
     goarch:
       - amd64
-      - arm64
     flags:
       - -trimpath
     ldflags:
@@ -27,24 +25,13 @@ archives:
 checksum:
   name_template: checksums.txt
 
+# semantic-release creates the GitHub release and its notes;
+# GoReleaser only attaches the build artifacts to it.
 changelog:
-  use: github
-  sort: asc
-  groups:
-    - title: Features
-      regexp: '^.*?feat(\(.+\))??!?:.+$'
-      order: 0
-    - title: Bug fixes
-      regexp: '^.*?fix(\(.+\))??!?:.+$'
-      order: 1
-    - title: Dependencies
-      regexp: '^.*?(build|chore)\(deps\)!?:.+$'
-      order: 2
-    - title: Other
-      order: 999
-  filters:
-    exclude:
-      - '^.*?(docs|test|ci)(\(.+\))??!?:.+$'
+  disable: true
+
+release:
+  mode: keep-existing
 
 dockers_v2:
   - images:
@@ -55,7 +42,6 @@ dockers_v2:
     dockerfile: Dockerfile.release
     platforms:
       - linux/amd64
-      - linux/arm64
     labels:
       org.opencontainers.image.source: "{{ .GitURL }}"
       org.opencontainers.image.version: "{{ .Version }}"

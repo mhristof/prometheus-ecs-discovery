@@ -104,6 +104,11 @@ the discovery file of new targets that Prometheus must scrape.
 
 ## Releases
 
-Pushing a `v*` tag runs GoReleaser, which publishes a GitHub release
-with Linux and macOS (amd64/arm64) binaries and checksums, and pushes
-a multi-arch image to `ghcr.io/mhristof/prometheus-ecs-discovery`.
+Every merge to `master` runs [semantic-release](https://semantic-release.gitbook.io/),
+which picks the next version from the
+[Conventional Commits](https://www.conventionalcommits.org/) since the last
+release (`fix:` → patch, `feat:` → minor, `!`/`BREAKING CHANGE` → major),
+tags it and creates a GitHub release. GoReleaser then attaches the
+linux/amd64 binary and checksums, and pushes the image to
+`ghcr.io/mhristof/prometheus-ecs-discovery`. Commits such as `chore:`,
+`docs:`, `test:` or `ci:` do not trigger a release.
