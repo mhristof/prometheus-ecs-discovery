@@ -15,16 +15,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -33,7 +36,7 @@ import (
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
-	"github.com/go-yaml/yaml"
+	"gopkg.in/yaml.v3"
 )
 
 type labels struct {
@@ -53,6 +56,9 @@ type labels struct {
 // Docker label for enabling dynamic port detection
 const dynamicPortLabel = "PROMETHEUS_DYNAMIC_EXPORT"
 
+// Number of concurrent workers used to fan out AWS API calls.
+const apiWorkers = 4
+
 var cluster = flag.String("config.cluster", "", "name of the cluster to scrape")
 var outFile = flag.String("config.write-to", "ecs_file_sd.yml", "path of file to write ECS service discovery information to")
 var interval = flag.Duration("config.scrape-interval", 60*time.Second, "interval at which to scrape the AWS API for ECS service discovery information")
@@ -60,11 +66,68 @@ var times = flag.Int("config.scrape-times", 0, "how many times to scrape before 
 var roleArn = flag.String("config.role-arn", "", "ARN of the role to assume when scraping the AWS API (optional)")
 var prometheusPortLabel = flag.String("config.port-label", "PROMETHEUS_EXPORTER_PORT", "Docker label to define the scrape port of the application (if missing an application won't be scraped)")
 var prometheusPathLabel = flag.String("config.path-label", "PROMETHEUS_EXPORTER_PATH", "Docker label to define the scrape path of the application")
-var prometheusSchemeLabel= flag.String("config.scheme-label", "PROMETHEUS_EXPORTER_SCHEME", "Docker label to define the scheme of the target application")
+var prometheusSchemeLabel = flag.String("config.scheme-label", "PROMETHEUS_EXPORTER_SCHEME", "Docker label to define the scheme of the target application")
 var prometheusFilterLabel = flag.String("config.filter-label", "", "Docker label (and optionally value) to require to scrape the application")
 var prometheusServerNameLabel = flag.String("config.server-name-label", "PROMETHEUS_EXPORTER_SERVER_NAME", "Docker label to define the server name")
 var prometheusJobNameLabel = flag.String("config.job-name-label", "PROMETHEUS_EXPORTER_JOB_NAME", "Docker label to define the job name")
 var prometheusDynamicPortDetection = flag.Bool("config.dynamic-port-detection", false, fmt.Sprintf("If true, only tasks with the Docker label %s=1 will be scraped", dynamicPortLabel))
+
+// ecsAPI is the subset of the ECS client used by this program.
+type ecsAPI interface {
+	ecs.ListClustersAPIClient
+	ecs.ListTasksAPIClient
+	DescribeClusters(context.Context, *ecs.DescribeClustersInput, ...func(*ecs.Options)) (*ecs.DescribeClustersOutput, error)
+	DescribeTasks(context.Context, *ecs.DescribeTasksInput, ...func(*ecs.Options)) (*ecs.DescribeTasksOutput, error)
+	DescribeTaskDefinition(context.Context, *ecs.DescribeTaskDefinitionInput, ...func(*ecs.Options)) (*ecs.DescribeTaskDefinitionOutput, error)
+	DescribeContainerInstances(context.Context, *ecs.DescribeContainerInstancesInput, ...func(*ecs.Options)) (*ecs.DescribeContainerInstancesOutput, error)
+}
+
+// ec2API is the subset of the EC2 client used by this program.
+type ec2API interface {
+	ec2.DescribeInstancesAPIClient
+}
+
+// exporterConfig holds the Docker label names (and filter) that
+// decide which containers are exported and how.
+type exporterConfig struct {
+	PortLabel            string
+	PathLabel            string
+	SchemeLabel          string
+	ServerNameLabel      string
+	JobNameLabel         string
+	DynamicPortDetection bool
+	// FilterLabel, if non-empty, must be present on the container.
+	// If HasFilterValue is set, its value must also equal FilterValue.
+	FilterLabel    string
+	FilterValue    string
+	HasFilterValue bool
+}
+
+// newExporterConfig builds an exporterConfig from the command line flags.
+func newExporterConfig() *exporterConfig {
+	cfg := &exporterConfig{
+		PortLabel:            *prometheusPortLabel,
+		PathLabel:            *prometheusPathLabel,
+		SchemeLabel:          *prometheusSchemeLabel,
+		ServerNameLabel:      *prometheusServerNameLabel,
+		JobNameLabel:         *prometheusJobNameLabel,
+		DynamicPortDetection: *prometheusDynamicPortDetection,
+	}
+	cfg.FilterLabel, cfg.FilterValue, cfg.HasFilterValue = strings.Cut(*prometheusFilterLabel, "=")
+	return cfg
+}
+
+// matchesFilter reports whether the Docker labels satisfy the filter.
+func (cfg *exporterConfig) matchesFilter(dockerLabels map[string]string) bool {
+	if cfg.FilterLabel == "" {
+		return true
+	}
+	v, ok := dockerLabels[cfg.FilterLabel]
+	if !ok {
+		return false
+	}
+	return !cfg.HasFilterValue || v == cfg.FilterValue
+}
 
 // logError is a convenience function that decodes all possible ECS
 // errors and displays them to standard error.
@@ -79,23 +142,19 @@ func logError(err error) {
 	}
 }
 
-// GetClusters retrieves a list of *ClusterArns from Amazon ECS,
+// GetClusters retrieves the list of cluster ARNs from Amazon ECS,
 // dealing with the mandatory pagination as needed.
-func GetClusters(svc *ecs.Client) (*ecs.ListClustersOutput, error) {
-	input := &ecs.ListClustersInput{}
-	output := &ecs.ListClustersOutput{}
-	for {
-		myoutput, err := svc.ListClusters(context.Background(), input)
+func GetClusters(ctx context.Context, svc ecs.ListClustersAPIClient) ([]string, error) {
+	var clusterArns []string
+	p := ecs.NewListClustersPaginator(svc, &ecs.ListClustersInput{})
+	for p.HasMorePages() {
+		page, err := p.NextPage(ctx)
 		if err != nil {
 			return nil, err
 		}
-		output.ClusterArns = append(output.ClusterArns, myoutput.ClusterArns...)
-		if myoutput.NextToken == nil {
-			break
-		}
-		input.NextToken = myoutput.NextToken
+		clusterArns = append(clusterArns, page.ClusterArns...)
 	}
-	return output, nil
+	return clusterArns, nil
 }
 
 // AugmentedTask represents an ECS task augmented with an extra set of
@@ -105,16 +164,6 @@ type AugmentedTask struct {
 	*ecstypes.Task
 	TaskDefinition *ecstypes.TaskDefinition
 	EC2Instance    *ec2types.Instance
-}
-
-// PrometheusContainer represents a tuple of information
-// (Container Name, Container ARN, Docker image, Port)
-// extracted from a task, its task definition
-type PrometheusContainer struct {
-	ContainerName string
-	ContainerArn  string
-	DockerImage   string
-	Port          int
 }
 
 // PrometheusTaskInfo is the final structure that will be
@@ -131,74 +180,72 @@ type PrometheusTaskInfo struct {
 // container in the task has a PROMETHEUS_EXPORTER_PORT
 //
 // Example:
-//     ...
-//             "Name": "apache",
-//             "DockerLabels": {
-//                  "PROMETHEUS_EXPORTER_PORT": "1234"
-//              },
-//     ...
-//              "PortMappings": [
-//                {
-//                  "ContainerPort": 1883,
-//                  "HostPort": 0,
-//                  "Protocol": "tcp"
-//                },
-//                {
-//                  "ContainerPort": 1234,
-//                  "HostPort": 0,
-//                  "Protocol": "tcp"
-//                }
-//              ],
-//     ...
-func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
+//
+//	...
+//	        "Name": "apache",
+//	        "DockerLabels": {
+//	             "PROMETHEUS_EXPORTER_PORT": "1234"
+//	         },
+//	...
+//	         "PortMappings": [
+//	           {
+//	             "ContainerPort": 1883,
+//	             "HostPort": 0,
+//	             "Protocol": "tcp"
+//	           },
+//	           {
+//	             "ContainerPort": 1234,
+//	             "HostPort": 0,
+//	             "Protocol": "tcp"
+//	           }
+//	         ],
+//	...
+func (t *AugmentedTask) ExporterInformation(cfg *exporterConfig) []*PrometheusTaskInfo {
 	ret := []*PrometheusTaskInfo{}
-	var host string
 	var ip string
+
+	if t.TaskDefinition == nil {
+		return ret
+	}
 
 	if t.LaunchType != ecstypes.LaunchTypeFargate {
 		if t.EC2Instance == nil {
 			return ret
 		}
-		if len(t.EC2Instance.NetworkInterfaces) == 0 {
-			return ret
-		}
-
+		instanceDNS := aws.ToString(t.EC2Instance.PrivateDnsName)
 		for _, iface := range t.EC2Instance.NetworkInterfaces {
-			if iface.PrivateIpAddress != nil && *iface.PrivateIpAddress != "" &&
-				iface.PrivateDnsName != nil && *iface.PrivateDnsName != "" &&
-				*iface.PrivateDnsName == *t.EC2Instance.PrivateDnsName {
-				ip = *iface.PrivateIpAddress
+			ifaceIP := aws.ToString(iface.PrivateIpAddress)
+			ifaceDNS := aws.ToString(iface.PrivateDnsName)
+			if ifaceIP != "" && ifaceDNS != "" && ifaceDNS == instanceDNS {
+				ip = ifaceIP
 				break
 			}
 		}
 		if ip == "" {
 			return ret
 		}
-
 	}
 
-	var filter []string
-	if *prometheusFilterLabel != "" {
-		filter = strings.Split(*prometheusFilterLabel, "=")
+	defs := make(map[string]ecstypes.ContainerDefinition, len(t.TaskDefinition.ContainerDefinitions))
+	for _, d := range t.TaskDefinition.ContainerDefinitions {
+		defs[aws.ToString(d.Name)] = d
 	}
 
 	for _, i := range t.Containers {
-		// Let's go over the containers to see which ones are defined
-		var d ecstypes.ContainerDefinition
-		for _, d = range t.TaskDefinition.ContainerDefinitions {
-			if *i.Name == *d.Name {
-				// Aha, the container definition match this container we
-				// are inspecting, stop the loop cos we got the D now.
-				break
-			}
-		}
-		if *i.Name != *d.Name && t.LaunchType != ecstypes.LaunchTypeFargate {
-			// Nope, no match, this container cannot be exported.  We continue.
+		d, ok := defs[aws.ToString(i.Name)]
+		if !ok {
+			// No container definition matches this container, so it
+			// cannot be exported.
 			continue
 		}
 
+		if !cfg.matchesFilter(d.DockerLabels) {
+			continue
+		}
+
+		targetIP := ip
 		var hostPort int32
-		if *prometheusDynamicPortDetection {
+		if cfg.DynamicPortDetection {
 			v, ok := d.DockerLabels[dynamicPortLabel]
 			if !ok || v != "1" {
 				// Nope, no Prometheus-exported port in this container def.
@@ -212,32 +259,17 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 				continue
 			}
 
-			if port := i.NetworkBindings[0].HostPort; port != nil {
-				hostPort = *port
-			}
+			hostPort = aws.ToInt32(i.NetworkBindings[0].HostPort)
 		} else {
-			v, ok := d.DockerLabels[*prometheusPortLabel]
+			v, ok := d.DockerLabels[cfg.PortLabel]
 			if !ok {
 				// Nope, no Prometheus-exported port in this container def.
 				// This container is no good.  We continue.
 				continue
 			}
 
-			if len(filter) != 0 {
-				v, ok := d.DockerLabels[filter[0]]
-				if !ok {
-					// Nope, the filter label isn't present.
-					continue
-				}
-				if len(filter) == 2 && v != filter[1] {
-					// Nope, the filter label value doesn't match.
-					continue
-				}
-			}
-
-			var exporterPort int
-			var err error
-			if exporterPort, err = strconv.Atoi(v); err != nil || exporterPort < 0 {
+			exporterPort, err := strconv.Atoi(v)
+			if err != nil || exporterPort <= 0 || exporterPort > 65535 {
 				// This container has an invalid port definition.
 				// This container is no good.  We continue.
 				continue
@@ -245,14 +277,14 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 
 			if len(i.NetworkBindings) > 0 {
 				for _, nb := range i.NetworkBindings {
-					if int(*nb.ContainerPort) == exporterPort {
-						hostPort = *nb.HostPort
+					if nb.ContainerPort != nil && int(*nb.ContainerPort) == exporterPort {
+						hostPort = aws.ToInt32(nb.HostPort)
 					}
 				}
 			} else {
 				for _, ni := range i.NetworkInterfaces {
-					if *ni.PrivateIpv4Address != "" {
-						ip = *ni.PrivateIpv4Address
+					if addr := aws.ToString(ni.PrivateIpv4Address); addr != "" {
+						targetIP = addr
 					}
 				}
 				hostPort = int32(exporterPort)
@@ -266,38 +298,34 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 			continue
 		}
 
-		var exporterServerName string
-		var exporterPath string
-		var scheme string
-		var ok bool
-		exporterServerName, ok = d.DockerLabels[*prometheusServerNameLabel]
-		if ok {
+		host := targetIP
+		if exporterServerName, ok := d.DockerLabels[cfg.ServerNameLabel]; ok {
 			host = strings.TrimRight(exporterServerName, "/")
-		} else {
-			// No server name, so fall back to ip address
-			host = ip
+		}
+		if host == "" {
+			// Neither a server name nor an IP address is known, so
+			// there is nothing Prometheus could scrape.
+			continue
 		}
 
 		labels := labels{
-			TaskArn:       *t.TaskArn,
-			TaskName:      *t.TaskDefinition.Family,
-			JobName:       d.DockerLabels[*prometheusJobNameLabel],
+			TaskArn:       aws.ToString(t.TaskArn),
+			TaskName:      aws.ToString(t.TaskDefinition.Family),
+			JobName:       d.DockerLabels[cfg.JobNameLabel],
 			TaskRevision:  fmt.Sprintf("%d", t.TaskDefinition.Revision),
-			TaskGroup:     *t.Group,
-			ClusterArn:    *t.ClusterArn,
-			ContainerName: *i.Name,
-			ContainerArn:  *i.ContainerArn,
-			DockerImage:   *d.Image,
+			TaskGroup:     aws.ToString(t.Group),
+			ClusterArn:    aws.ToString(t.ClusterArn),
+			ContainerName: aws.ToString(i.Name),
+			ContainerArn:  aws.ToString(i.ContainerArn),
+			DockerImage:   aws.ToString(d.Image),
 		}
 
-		exporterPath, ok = d.DockerLabels[*prometheusPathLabel]
-		if ok {
+		if exporterPath, ok := d.DockerLabels[cfg.PathLabel]; ok {
 			labels.MetricsPath = exporterPath
 		}
 
-		scheme, ok = d.DockerLabels[*prometheusSchemeLabel]
-		if ok {
-		    labels.Scheme = scheme
+		if scheme, ok := d.DockerLabels[cfg.SchemeLabel]; ok {
+			labels.Scheme = scheme
 		}
 
 		ret = append(ret, &PrometheusTaskInfo{
@@ -310,44 +338,43 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 
 // AddTaskDefinitionsOfTasks adds to each Task the TaskDefinition
 // corresponding to it.
-func AddTaskDefinitionsOfTasks(svc *ecs.Client, taskList []*AugmentedTask) ([]*AugmentedTask, error) {
+func AddTaskDefinitionsOfTasks(ctx context.Context, svc ecsAPI, taskList []*AugmentedTask) ([]*AugmentedTask, error) {
 	task2def := make(map[string]*ecstypes.TaskDefinition)
 	for _, task := range taskList {
-		task2def[*task.TaskDefinitionArn] = nil
+		if task.TaskDefinitionArn != nil {
+			task2def[*task.TaskDefinitionArn] = nil
+		}
 	}
 
-	jobs := make(chan *ecs.DescribeTaskDefinitionInput, len(task2def))
-	results := make(chan struct {
+	type result struct {
 		out *ecs.DescribeTaskDefinitionOutput
 		err error
-	}, len(task2def))
+	}
+	jobs := make(chan string, len(task2def))
+	results := make(chan result, len(task2def))
 
-	for w := 1; w <= 4; w++ {
+	for w := 0; w < apiWorkers; w++ {
 		go func() {
-			for in := range jobs {
-				out, err := svc.DescribeTaskDefinition(context.Background(), in)
-				results <- struct {
-					out *ecs.DescribeTaskDefinitionOutput
-					err error
-				}{out, err}
+			for arn := range jobs {
+				out, err := svc.DescribeTaskDefinition(ctx, &ecs.DescribeTaskDefinitionInput{TaskDefinition: aws.String(arn)})
+				results <- result{out, err}
 			}
 		}()
 	}
 
-	for tn := range task2def {
-		m := string(append([]byte{}, tn...))
-		jobs <- &ecs.DescribeTaskDefinitionInput{TaskDefinition: &m}
+	for arn := range task2def {
+		jobs <- arn
 	}
 	close(jobs)
 
 	var err error
 	for range task2def {
-		result := <-results
-		if result.err != nil {
-			err = result.err
+		res := <-results
+		if res.err != nil {
+			err = res.err
 			log.Printf("Error describing task definition: %s", err)
-		} else {
-			task2def[*result.out.TaskDefinition.TaskDefinitionArn] = result.out.TaskDefinition
+		} else if res.out.TaskDefinition != nil {
+			task2def[aws.ToString(res.out.TaskDefinition.TaskDefinitionArn)] = res.out.TaskDefinition
 		}
 	}
 	if err != nil {
@@ -355,20 +382,9 @@ func AddTaskDefinitionsOfTasks(svc *ecs.Client, taskList []*AugmentedTask) ([]*A
 	}
 
 	for _, task := range taskList {
-		task.TaskDefinition = task2def[*task.TaskDefinitionArn]
+		task.TaskDefinition = task2def[aws.ToString(task.TaskDefinitionArn)]
 	}
 	return taskList, nil
-}
-
-// StringToStarString converts a list of strings to a list of
-// pointers to strings, which is a common requirement of the
-// Amazon API.
-func StringToStarString(s []string) []*string {
-	c := make([]*string, 0, len(s))
-	for n := range s {
-		c = append(c, &s[n])
-	}
-	return c
 }
 
 // SplitArray splits given array into chunks, it's usefull
@@ -386,36 +402,23 @@ func SplitArray(a []string, size int) [][]string {
 	return splitted
 }
 
-// DescribeInstancesUnpaginated describes a list of EC2 instances.
-// It is unpaginated because the API function does not require
-// pagination.
-func DescribeInstancesUnpaginated(svc *ec2.Client, instanceIds []string) ([]ec2types.Instance, error) {
-	if len(instanceIds) == 0 {
-		return nil, nil
-	}
-	finalOutput := &ec2.DescribeInstancesOutput{}
-	splittedInstanceIds := SplitArray(instanceIds, 100)
-	for _, chunkedInstanceIds := range splittedInstanceIds {
-		input := &ec2.DescribeInstancesInput{
+// DescribeInstances describes a list of EC2 instances, in chunks
+// of 100 IDs per call.
+func DescribeInstances(ctx context.Context, svc ec2.DescribeInstancesAPIClient, instanceIds []string) ([]ec2types.Instance, error) {
+	result := []ec2types.Instance{}
+	for _, chunkedInstanceIds := range SplitArray(instanceIds, 100) {
+		p := ec2.NewDescribeInstancesPaginator(svc, &ec2.DescribeInstancesInput{
 			InstanceIds: chunkedInstanceIds,
-		}
-		for {
-			output, err := svc.DescribeInstances(context.Background(), input)
+		})
+		for p.HasMorePages() {
+			output, err := p.NextPage(ctx)
 			if err != nil {
 				return nil, err
 			}
 			log.Printf("Described %d EC2 reservations", len(output.Reservations))
-			finalOutput.Reservations = append(finalOutput.Reservations, output.Reservations...)
-			if output.NextToken == nil {
-				break
+			for _, rsv := range output.Reservations {
+				result = append(result, rsv.Instances...)
 			}
-			input.NextToken = output.NextToken
-		}
-	}
-	result := []ec2types.Instance{}
-	for _, rsv := range finalOutput.Reservations {
-		for _, i := range rsv.Instances {
-			result = append(result, i)
 		}
 	}
 	return result, nil
@@ -423,11 +426,11 @@ func DescribeInstancesUnpaginated(svc *ec2.Client, instanceIds []string) ([]ec2t
 
 // AddContainerInstancesToTasks adds to each Task the EC2 instance
 // running its containers.
-func AddContainerInstancesToTasks(svc *ecs.Client, svcec2 *ec2.Client, taskList []*AugmentedTask) ([]*AugmentedTask, error) {
+func AddContainerInstancesToTasks(ctx context.Context, svc ecsAPI, svcec2 ec2API, taskList []*AugmentedTask) ([]*AugmentedTask, error) {
 
 	clusterArnToContainerInstancesArns := make(map[string]map[string]*ecstypes.ContainerInstance)
 	for _, task := range taskList {
-		if task.ContainerInstanceArn != nil {
+		if task.ContainerInstanceArn != nil && task.ClusterArn != nil {
 			if _, ok := clusterArnToContainerInstancesArns[*task.ClusterArn]; !ok {
 				clusterArnToContainerInstancesArns[*task.ClusterArn] = make(map[string]*ecstypes.ContainerInstance)
 			}
@@ -442,13 +445,12 @@ func AddContainerInstancesToTasks(svc *ecs.Client, svcec2 *ec2.Client, taskList 
 			keys = append(keys, k)
 		}
 
-		splittedKeys := SplitArray(keys, 100)
-		for _, chunkedKeys := range splittedKeys {
+		for _, chunkedKeys := range SplitArray(keys, 100) {
 			input := &ecs.DescribeContainerInstancesInput{
-				Cluster:            &clusterArn,
+				Cluster:            aws.String(clusterArn),
 				ContainerInstances: chunkedKeys,
 			}
-			output, err := svc.DescribeContainerInstances(context.Background(), input)
+			output, err := svc.DescribeContainerInstances(ctx, input)
 			if err != nil {
 				return nil, err
 			}
@@ -457,6 +459,9 @@ func AddContainerInstancesToTasks(svc *ecs.Client, svcec2 *ec2.Client, taskList 
 				log.Printf("Described %d failures in cluster %s", len(output.Failures), clusterArn)
 			}
 			for _, ci := range output.ContainerInstances {
+				if ci.ContainerInstanceArn == nil || ci.Ec2InstanceId == nil {
+					continue
+				}
 				cInst := ci
 				clusterArnToContainerInstancesArns[clusterArn][*cInst.ContainerInstanceArn] = &cInst
 				instanceIDToEC2Instance[*cInst.Ec2InstanceId] = nil
@@ -472,25 +477,28 @@ func AddContainerInstancesToTasks(svc *ecs.Client, svcec2 *ec2.Client, taskList 
 		keys = append(keys, id)
 	}
 
-	instances, err := DescribeInstancesUnpaginated(svcec2, keys)
+	instances, err := DescribeInstances(ctx, svcec2, keys)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, i := range instances {
+		if i.InstanceId == nil {
+			continue
+		}
 		inst := i
 		instanceIDToEC2Instance[*i.InstanceId] = &inst
 	}
 
 	for _, task := range taskList {
-		if task.ContainerInstanceArn != nil {
-			containerInstance, ok := clusterArnToContainerInstancesArns[*task.ClusterArn][*task.ContainerInstanceArn]
-			if !ok {
+		if task.ContainerInstanceArn != nil && task.ClusterArn != nil {
+			containerInstance := clusterArnToContainerInstancesArns[*task.ClusterArn][*task.ContainerInstanceArn]
+			if containerInstance == nil {
 				log.Printf("Cannot find container instance %s in cluster %s", *task.ContainerInstanceArn, *task.ClusterArn)
 				continue
 			}
-			instance, ok := instanceIDToEC2Instance[*containerInstance.Ec2InstanceId]
-			if !ok {
+			instance := instanceIDToEC2Instance[*containerInstance.Ec2InstanceId]
+			if instance == nil {
 				log.Printf("Cannot find EC2 instance %s", *containerInstance.Ec2InstanceId)
 				continue
 			}
@@ -501,58 +509,59 @@ func AddContainerInstancesToTasks(svc *ecs.Client, svcec2 *ec2.Client, taskList 
 	return taskList, nil
 }
 
-// GetTasksOfClusters returns the EC2 tasks running in a list of Clusters.
-func GetTasksOfClusters(svc *ecs.Client, clusterArns []*string) ([]ecstypes.Task, error) {
-	jobs := make(chan *string, len(clusterArns))
-	results := make(chan struct {
-		out *ecs.DescribeTasksOutput
-		err error
-	}, len(clusterArns))
+// getTasksOfCluster returns the running tasks of a single cluster.
+func getTasksOfCluster(ctx context.Context, svc ecsAPI, clusterArn string) ([]ecstypes.Task, error) {
+	var tasks []ecstypes.Task
+	p := ecs.NewListTasksPaginator(svc, &ecs.ListTasksInput{
+		Cluster: aws.String(clusterArn),
+	})
+	for p.HasMorePages() {
+		output, err := p.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("listing tasks of cluster %s: %w", clusterArn, err)
+		}
+		if len(output.TaskArns) == 0 {
+			continue
+		}
+		log.Printf("Inspected cluster %s, found %d tasks", clusterArn, len(output.TaskArns))
+		descOutput, err := svc.DescribeTasks(ctx, &ecs.DescribeTasksInput{
+			Cluster: aws.String(clusterArn),
+			Tasks:   output.TaskArns,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("describing tasks of cluster %s: %w", clusterArn, err)
+		}
+		log.Printf("Described %d tasks in cluster %s", len(descOutput.Tasks), clusterArn)
+		if len(descOutput.Failures) > 0 {
+			log.Printf("Described %d failures in cluster %s", len(descOutput.Failures), clusterArn)
+		}
+		for _, task := range descOutput.Tasks {
+			// ListTasks returns tasks whose desired status is RUNNING,
+			// which includes tasks that are still being provisioned
+			// and may not have an IP address yet.
+			if aws.ToString(task.LastStatus) != "RUNNING" {
+				continue
+			}
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks, nil
+}
 
-	for w := 1; w <= 4; w++ {
+// GetTasksOfClusters returns the running tasks in a list of Clusters.
+func GetTasksOfClusters(ctx context.Context, svc ecsAPI, clusterArns []string) ([]ecstypes.Task, error) {
+	type result struct {
+		tasks []ecstypes.Task
+		err   error
+	}
+	jobs := make(chan string, len(clusterArns))
+	results := make(chan result, len(clusterArns))
+
+	for w := 0; w < apiWorkers; w++ {
 		go func() {
 			for clusterArn := range jobs {
-				input := &ecs.ListTasksInput{
-					Cluster: clusterArn,
-				}
-				finalOutput := &ecs.DescribeTasksOutput{}
-				var err error
-				for {
-					output, err1 := svc.ListTasks(context.Background(), input)
-					if err1 != nil {
-						err = err1
-						log.Printf("Error listing tasks of cluster %s: %s", *clusterArn, err)
-						break
-					}
-					if len(output.TaskArns) == 0 {
-						break
-					}
-					log.Printf("Inspected cluster %s, found %d tasks", *clusterArn, len(output.TaskArns))
-					inDescribe := &ecs.DescribeTasksInput{
-						Cluster: clusterArn,
-						Tasks:   output.TaskArns,
-					}
-					descOutput, err2 := svc.DescribeTasks(context.Background(), inDescribe)
-					if err2 != nil {
-						err = err2
-						log.Printf("Error describing tasks of cluster %s: %s", *clusterArn, err)
-						break
-					}
-					log.Printf("Described %d tasks in cluster %s", len(descOutput.Tasks), *clusterArn)
-					if len(descOutput.Failures) > 0 {
-						log.Printf("Described %d failures in cluster %s", len(descOutput.Failures), *clusterArn)
-					}
-					finalOutput.Tasks = append(finalOutput.Tasks, descOutput.Tasks...)
-					finalOutput.Failures = append(finalOutput.Failures, descOutput.Failures...)
-					if output.NextToken == nil {
-						break
-					}
-					input.NextToken = output.NextToken
-				}
-				results <- struct {
-					out *ecs.DescribeTasksOutput
-					err error
-				}{finalOutput, err}
+				tasks, err := getTasksOfCluster(ctx, svc, clusterArn)
+				results <- result{tasks, err}
 			}
 		}()
 	}
@@ -563,14 +572,17 @@ func GetTasksOfClusters(svc *ecs.Client, clusterArns []*string) ([]ecstypes.Task
 	close(jobs)
 
 	tasks := []ecstypes.Task{}
+	var err error
 	for range clusterArns {
-		result := <-results
-		if result.err != nil {
-			return nil, result.err
+		res := <-results
+		if res.err != nil {
+			err = res.err
+			continue
 		}
-		for _, task := range result.out.Tasks {
-			tasks = append(tasks, task)
-		}
+		tasks = append(tasks, res.tasks...)
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	return tasks, nil
@@ -578,8 +590,8 @@ func GetTasksOfClusters(svc *ecs.Client, clusterArns []*string) ([]ecstypes.Task
 
 // GetAugmentedTasks gets the fully AugmentedTasks running on
 // a list of Clusters.
-func GetAugmentedTasks(svc *ecs.Client, svcec2 *ec2.Client, clusterArns []*string) ([]*AugmentedTask, error) {
-	simpleTasks, err := GetTasksOfClusters(svc, clusterArns)
+func GetAugmentedTasks(ctx context.Context, svc ecsAPI, svcec2 ec2API, clusterArns []string) ([]*AugmentedTask, error) {
+	simpleTasks, err := GetTasksOfClusters(ctx, svc, clusterArns)
 	if err != nil {
 		return nil, err
 	}
@@ -588,12 +600,12 @@ func GetAugmentedTasks(svc *ecs.Client, svcec2 *ec2.Client, clusterArns []*strin
 	for i := 0; i < len(simpleTasks); i++ {
 		tasks = append(tasks, &AugmentedTask{&simpleTasks[i], nil, nil})
 	}
-	tasks, err = AddTaskDefinitionsOfTasks(svc, tasks)
+	tasks, err = AddTaskDefinitionsOfTasks(ctx, svc, tasks)
 	if err != nil {
 		return nil, err
 	}
 
-	tasks, err = AddContainerInstancesToTasks(svc, svcec2, tasks)
+	tasks, err = AddContainerInstancesToTasks(ctx, svc, svcec2, tasks)
 	if err != nil {
 		return nil, err
 	}
@@ -601,77 +613,109 @@ func GetAugmentedTasks(svc *ecs.Client, svcec2 *ec2.Client, clusterArns []*strin
 	return tasks, nil
 }
 
+// marshalTargets renders the targets as a Prometheus file_sd YAML
+// document, using the same 2-space indentation as yaml.v2 did.
+func marshalTargets(infos []*PrometheusTaskInfo) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(infos); err != nil {
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// writeFileAtomic writes data to a temporary file next to path and
+// renames it into place, so that Prometheus never reads a partially
+// written file.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) (err error) {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(f.Name())
+		}
+	}()
+	if _, err = f.Write(data); err != nil {
+		return err
+	}
+	if err = f.Chmod(perm); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
+}
+
+// resolveClusters returns the ARNs of the clusters to scrape: the
+// one named by -config.cluster, or all clusters otherwise.
+func resolveClusters(ctx context.Context, svc ecsAPI, name string) ([]string, error) {
+	if name == "" {
+		return GetClusters(ctx, svc)
+	}
+	res, err := svc.DescribeClusters(ctx, &ecs.DescribeClustersInput{
+		Clusters: []string{name},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(res.Clusters) == 0 || res.Clusters[0].ClusterArn == nil {
+		return nil, fmt.Errorf("%s cluster not found", name)
+	}
+	return []string{*res.Clusters[0].ClusterArn}, nil
+}
+
+// work performs a single discovery cycle and writes the result to outFile.
+func work(ctx context.Context, svc ecsAPI, svcec2 ec2API, cfg *exporterConfig) error {
+	clusterArns, err := resolveClusters(ctx, svc, *cluster)
+	if err != nil {
+		return err
+	}
+
+	tasks, err := GetAugmentedTasks(ctx, svc, svcec2, clusterArns)
+	if err != nil {
+		return err
+	}
+	infos := []*PrometheusTaskInfo{}
+	for _, t := range tasks {
+		infos = append(infos, t.ExporterInformation(cfg)...)
+	}
+	m, err := marshalTargets(infos)
+	if err != nil {
+		return err
+	}
+	log.Printf("Writing %d discovered exporters to %s", len(infos), *outFile)
+	return writeFileAtomic(*outFile, m, 0644)
+}
+
 func main() {
 	flag.Parse()
 
-	config, err := config.LoadDefaultConfig(context.Background())
+	awsConfig, err := config.LoadDefaultConfig(context.Background())
 	if err != nil {
 		logError(err)
-		return
+		os.Exit(1)
 	}
 
 	if *roleArn != "" {
 		// Assume role
-		stsSvc := sts.NewFromConfig(config)
-		config.Credentials = stscreds.NewAssumeRoleProvider(stsSvc, *roleArn)
+		stsSvc := sts.NewFromConfig(awsConfig)
+		awsConfig.Credentials = aws.NewCredentialsCache(stscreds.NewAssumeRoleProvider(stsSvc, *roleArn))
 	}
 
 	// Initialise AWS Service clients
-	svc := ecs.NewFromConfig(config)
-	svcec2 := ec2.NewFromConfig(config)
+	svc := ecs.NewFromConfig(awsConfig)
+	svcec2 := ec2.NewFromConfig(awsConfig)
+	cfg := newExporterConfig()
 
-	work := func() {
-		var clusters *ecs.ListClustersOutput
-
-		if *cluster != "" {
-			res, err := svc.DescribeClusters(context.Background(), &ecs.DescribeClustersInput{
-				Clusters: []string{*cluster},
-			})
-			if err != nil {
-				logError(err)
-				return
-			}
-
-			if len(res.Clusters) == 0 {
-				logError(fmt.Errorf("%s cluster not found", *cluster))
-				return
-			}
-
-			clusters = &ecs.ListClustersOutput{
-				ClusterArns: []string{*cluster},
-			}
-		} else {
-			c, err := GetClusters(svc)
-			if err != nil {
-				logError(err)
-				return
-			}
-			clusters = c
-
-		}
-
-		tasks, err := GetAugmentedTasks(svc, svcec2, StringToStarString(clusters.ClusterArns))
-		if err != nil {
-			logError(err)
-			return
-		}
-		infos := []*PrometheusTaskInfo{}
-		for _, t := range tasks {
-			info := t.ExporterInformation()
-			infos = append(infos, info...)
-		}
-		m, err := yaml.Marshal(infos)
-		if err != nil {
-			logError(err)
-			return
-		}
-		log.Printf("Writing %d discovered exporters to %s", len(infos), *outFile)
-		err = ioutil.WriteFile(*outFile, m, 0644)
-		if err != nil {
-			logError(err)
-			return
-		}
-	}
+	failed := false
 	s := time.NewTimer(1 * time.Millisecond)
 	t := time.NewTicker(*interval)
 	n := *times
@@ -680,10 +724,19 @@ func main() {
 		case <-s.C:
 		case <-t.C:
 		}
-		work()
+		// Bound each cycle so that a hung API call cannot stall discovery forever.
+		ctx, cancel := context.WithTimeout(context.Background(), *interval)
+		if err := work(ctx, svc, svcec2, cfg); err != nil {
+			logError(err)
+			failed = true
+		}
+		cancel()
 		n = n - 1
 		if *times > 0 && n == 0 {
 			break
 		}
+	}
+	if failed {
+		os.Exit(1)
 	}
 }
